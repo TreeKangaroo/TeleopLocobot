@@ -8,7 +8,7 @@ from arm import InterbotixManipulatorXS
 #from interbotix_xs_modules.arm import InterbotixManipulatorXS
 import numpy as np
 
-import time, argparse, threading, tqdm
+import time, argparse, threading, tqdm, timeit
 
 from queue import Queue
 import numpy as np
@@ -18,6 +18,7 @@ from scipy.spatial.transform import Rotation as R
 from mocap.utils.mp_utils import hand_tracker
 import trakstar_utils as tkut
 import teleop_utils as tlut
+import pybullet as p
 
 
 parser = argparse.ArgumentParser()
@@ -93,6 +94,7 @@ def get_tf(trans, rots, vision):
         #ms_pos = self.quat_90.apply(ms_pos)
         ms_rot = rots
     else:
+        """
         ms_pos = axis_correction.apply(trans)
         ms_rot = axis_correction * rots
 
@@ -103,34 +105,71 @@ def get_tf(trans, rots, vision):
         #print(ms_pos)
         #ms_rot = R.from_euler('y', 180, degrees=True) * ms_rot
         ms_rot = R.from_euler('z', 180, degrees=True) * ms_rot
+        """
+        ms_pos = self.axis_correction.apply(trans)
+        ms_rot = self.axis_correction * rots
 
+        ms_pos[0] = -ms_pos[0]
+        ms_pos[1] = -ms_pos[1]
+
+        ms_pos = self.quat_90.apply(ms_pos)
+        ms_rot = self.idk * ms_rot
 
     return ms_pos, ms_rot
 
-def get_cmd_q(robot, trans, rots, vision, offset, roffset):
+def get_cmd_q(robot, robotId, trans, rots, vision, offset, roffset):
     ms_pos, ms_rot = get_tf(trans, rots, vision)
 
     ms_pos += offset
     #print('MS_POS           ', ms_pos)
     ms_rot *= roffset
 
-    T_sd = np.identity(4)
-
-    T_sd[0:3, 0:3] = ms_rot.as_matrix()
-    T_sd[0:3, 3] = ms_pos
-
     #print(T_sd)
-    thetalist,  _ =robot.set_ee_pose_matrix(T_sd, blocking=False)
-    robot.set_joint_positions(thetalist, blocking=False)
+    def wrap_theta_list(bot, theta_list):
+        """
+        Wrap an array of joint commands to [-pi, pi) and between the joint limits.
+
+        :param theta_list: array of floats to wrap
+        :return: array of floats wrapped between [-pi, pi)
+        """
+        REV = 2*np.pi
+        theta_list = (theta_list + np.pi) % REV - np.pi
+        for x in range(0,len(theta_list)):
+            if round(theta_list[x], 3) < round(bot.group_info.joint_lower_limits[x], 3):
+                theta_list[x] += REV
+            elif round(theta_list[x], 3) > round(bot.group_info.joint_upper_limits[x], 3):
+                theta_list[x] -= REV
+        return theta_list
+
+    #start = timeit.default_timer()
     
-    pass
+    ik_res = p.calculateInverseKinematics(robotId, 4, ms_pos, ms_rot.as_quat(), maxNumIterations=100,residualThreshold=.01)
+    ik = wrap_theta_list(robot, np.array(ik_res[0:5]))
+    p.setJointMotorControlArray(robotId, [0,1,2,3,4], p.POSITION_CONTROL, ik_res[0:5])
+    robot.set_joint_positions(ik, blocking=False)
+    #print("The difference of time is :", 
+              #timeit.default_timer() - start)
+
+    p.stepSimulation()
+    time.sleep(0.02)
+    return ik
 
 def main():
+
     np.set_printoptions(precision=3, suppress=True)
 
     bot = InterbotixManipulatorXS("wx200", "arm", "gripper")
+    #bot.dxl.robot_set_motor_registers("group", "arm", 'Position_P_Gain', 800)
+    #bot.dxl.robot_set_motor_registers("group", "arm", 'Position_I_Gain', 0)
     bot.arm.go_to_home_pose()
-
+    
+    physicsClient = p.connect(p.GUI)
+    p.setTimeStep( 1.0 / 100)
+    p.setGravity(0,0,-9.81)
+    #p.setRealTimeSimulation(1)
+   
+    robotId = p.loadURDF('/data/scratch/wangmj/interbotix/src/interbotix_ros_manipulators/interbotix_ros_xsarms/interbotix_xsarm_descriptions/urdf/wx200.urdf',
+                  useFixedBase=True)
     """
     Check which kind of teleop mechanism to use
     """
@@ -156,6 +195,10 @@ def main():
     Main loop; has no safety constraints added
     """
     initialized = False
+
+    arrayf = np.zeros((500, 5))
+    arrayik = np.zeros((500,4,4))
+    count = 0
     while True:
         if args.vision:
             tr_tuple = q.get()
@@ -168,6 +211,9 @@ def main():
             trans, rots=trans_in[3], rots_in[3]
             #print('Trans:    ', trans)
             
+
+
+            
             pos_thumb = trans_in[0]
             pos_index = trans_in[1]
             cdist_thumb_index = np.linalg.norm(pos_thumb - pos_index)
@@ -175,17 +221,30 @@ def main():
                 bot.gripper.grasp()
             else:
                 bot.gripper.release()
+            
         ms_pos, ms_rot_mat = get_pose(bot.arm)
         ms_rot = R.from_matrix(ms_rot_mat)
         
         if not initialized:
             initialized = True
             offset, roffset = init_poses(bot.arm, trans, rots, args.vision)
-            get_cmd_q(bot.arm, trans, rots, args.vision, offset, roffset)
+            get_cmd_q(bot.arm, robotId, trans, rots, args.vision, offset, roffset)
+            
             print('OFFSET:   ',offset)
         else:
-            get_cmd_q(bot.arm, trans, rots, args.vision, offset, roffset)
-    thread.join()
+            ik=get_cmd_q(bot.arm, robotId, trans, rots, args.vision, offset, roffset)
+            
+            if count<500:
+                arrayf[count, :] = ik
+                #arrayik[count, :, :] = T_sd
+            if count ==500:
+                print('SAVING')
+                #with open('jointsp.npy', 'wb') as f:
+                    #np.save(f, arrayf)
+                #with open('ik.npy', 'wb') as g:
+                    #np.save(g, arrayik)
+            count+=1
+            
 
 if __name__=='__main__':
     main()
