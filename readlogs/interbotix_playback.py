@@ -59,6 +59,7 @@ def main():
     bot.arm.go_to_home_pose()
 
     for row in a:
+        print(row)
         #thetalist,  _ =bot.arm.set_ee_pose_matrix(row, blocking=False)
         #print('theta    ',thetalist)
         #ms_pos = row[0:3, 3].flatten()
